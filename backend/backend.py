@@ -190,6 +190,31 @@ Provide 3 financial tips.
 
     return await invoke_llm("You are a financial advisor.", prompt)
 
+async def generate_category_insights(user_id: str, category: str) -> str:
+    transactions = await db.transactions.find(
+        {"user_id": user_id, "category": category}
+    ).sort("date", -1).limit(15).to_list(15)
+
+    if not transactions:
+        return f"No {category} transactions yet. Add a few to unlock insights."
+
+    total_spending = sum(t.get("amount", 0) for t in transactions)
+    avg_spending = total_spending / len(transactions) if transactions else 0
+    latest = transactions[0]
+    latest_desc = latest.get("description", "recent transaction")[:80]
+
+    prompt = f"""
+Category: {category}
+Recent count: {len(transactions)}
+Total: ${total_spending:.2f}
+Average: ${avg_spending:.2f}
+Most recent: {latest_desc}
+
+Provide 2 concise, actionable insights for this category.
+"""
+
+    return await invoke_llm("You are a financial advisor.", prompt)
+
 # ==================== ROUTES ====================
 
 @api_router.get("/")
@@ -371,6 +396,11 @@ async def update_habit_progress(user_id: str, category: str, amount: float):
 @api_router.get("/insights/{user_id}")
 async def get_ai_insights(user_id: str):
     insights = await generate_insights(user_id)
+    return {"insights": insights}
+
+@api_router.get("/insights/{user_id}/category/{category}")
+async def get_category_insights(user_id: str, category: str):
+    insights = await generate_category_insights(user_id, category)
     return {"insights": insights}
 
 @api_router.post("/chat")
