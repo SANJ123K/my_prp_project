@@ -6,11 +6,13 @@ import os
 import logging
 from pathlib import Path
 from pydantic import BaseModel, Field
+from pydantic import EmailStr
 from typing import List, Optional, Dict
 import uuid
 from datetime import datetime, timedelta
 import json
 import re
+from passlib.context import CryptContext
 
 from openai import AsyncOpenAI
 
@@ -32,6 +34,7 @@ groq_client = AsyncOpenAI(
 
 app = FastAPI()
 api_router = APIRouter(prefix="/api")
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 # ==================== LLM HELPER ====================
 
@@ -82,14 +85,24 @@ class ChatRequest(BaseModel):
 class User(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     name: str
-    email: str
+    email: EmailStr
     phone: Optional[str] = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
 class UserCreate(BaseModel):
     name: str
-    email: str
+    email: EmailStr
     phone: Optional[str] = None
+
+class SignupRequest(BaseModel):
+    name: str
+    email: EmailStr
+    password: str
+    confirm_password: str
+
+class LoginRequest(BaseModel):
+    email: EmailStr
+    password: str
 
 class Credit(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
@@ -224,9 +237,52 @@ async def root():
 # User endpoints
 @api_router.post("/users", response_model=User)
 async def create_user(user: UserCreate):
-    user_obj = User(**user.dict())
+    existing_user = await db.users.find_one({"email": user.email.lower()})
+    if existing_user:
+        raise HTTPException(status_code=409, detail="Email already exists")
+
+    user_data = user.dict()
+    user_data["email"] = user_data["email"].lower()
+    user_obj = User(**user_data)
     await db.users.insert_one(user_obj.dict())
     return user_obj
+
+@api_router.post("/auth/signup", response_model=User)
+async def signup(request: SignupRequest):
+    if request.password != request.confirm_password:
+        raise HTTPException(status_code=400, detail="Passwords do not match")
+
+    if len(request.password) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
+
+    normalized_email = request.email.lower()
+    existing_user = await db.users.find_one({"email": normalized_email})
+    if existing_user:
+        raise HTTPException(status_code=409, detail="Email already exists")
+
+    user_obj = User(
+        name=request.name.strip(),
+        email=normalized_email,
+    )
+
+    user_doc = user_obj.dict()
+    user_doc["password_hash"] = pwd_context.hash(request.password)
+    await db.users.insert_one(user_doc)
+    return user_obj
+
+@api_router.post("/auth/login", response_model=User)
+async def login(request: LoginRequest):
+    normalized_email = request.email.lower()
+    existing_user = await db.users.find_one({"email": normalized_email})
+
+    if not existing_user:
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+
+    password_hash = existing_user.get("password_hash")
+    if not password_hash or not pwd_context.verify(request.password, password_hash):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+
+    return User(**existing_user)
 
 @api_router.get("/users/{user_id}", response_model=User)
 async def get_user(user_id: str):
