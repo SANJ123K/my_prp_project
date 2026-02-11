@@ -78,6 +78,10 @@ class SMSTransactionRequest(BaseModel):
     sms_text: str
     date: Optional[datetime] = None
 
+class TransactionCategoryUpdate(BaseModel):
+    user_id: str
+    category: str
+
 class ChatRequest(BaseModel):
     user_id: str
     message: str
@@ -345,6 +349,37 @@ async def get_user_transactions(user_id: str, limit: int = 50):
         {"user_id": user_id}
     ).sort("date", -1).limit(limit).to_list(limit)
     return [Transaction(**t) for t in transactions]
+
+@api_router.put("/transactions/{transaction_id}/category", response_model=Transaction)
+async def update_transaction_category(transaction_id: str, request: TransactionCategoryUpdate):
+    allowed_categories = {
+        "Food",
+        "Transport",
+        "Shopping",
+        "Bills",
+        "Entertainment",
+        "Health",
+        "Education",
+        "Travel",
+        "Other",
+    }
+
+    normalized_category = request.category.strip().title()
+    if normalized_category not in allowed_categories:
+        raise HTTPException(status_code=400, detail="Invalid category")
+
+    update_result = await db.transactions.update_one(
+        {"id": transaction_id, "user_id": request.user_id},
+        {"$set": {"category": normalized_category}},
+    )
+
+    if update_result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+
+    updated_transaction = await db.transactions.find_one(
+        {"id": transaction_id, "user_id": request.user_id}
+    )
+    return Transaction(**updated_transaction)
 
 @api_router.get("/transactions/{user_id}/analytics")
 async def get_transaction_analytics(user_id: str, days: int = 30):
