@@ -12,6 +12,9 @@ import uuid
 from datetime import datetime, timedelta
 import json
 import re
+import xml.etree.ElementTree as ET
+from html import unescape
+from urllib.request import urlopen, Request
 from passlib.context import CryptContext
 
 from openai import AsyncOpenAI
@@ -81,6 +84,17 @@ class SMSTransactionRequest(BaseModel):
 class TransactionCategoryUpdate(BaseModel):
     user_id: str
     category: str
+
+class TransactionAmountUpdate(BaseModel):
+    user_id: str
+    amount: float
+
+class TransactionUpdateRequest(BaseModel):
+    user_id: str
+    amount: Optional[float] = None
+    category: Optional[str] = None
+    description: Optional[str] = None
+    date: Optional[datetime] = None
 
 class ChatRequest(BaseModel):
     user_id: str
@@ -152,6 +166,14 @@ class ChatMessage(BaseModel):
     role: str
     message: str
     timestamp: datetime = Field(default_factory=datetime.utcnow)
+
+class FinancialNewsItem(BaseModel):
+    title: str
+    summary: str
+    source: str
+    link: str
+    published_at: Optional[datetime] = None
+    sentiment: str = "neutral"
 
 # ==================== AI FUNCTIONS ====================
 
@@ -231,6 +253,100 @@ Provide 2 concise, actionable insights for this category.
 """
 
     return await invoke_llm("You are a financial advisor.", prompt)
+
+def _extract_summary(title: str, text: str) -> str:
+    cleaned = re.sub(r"<[^>]+>", " ", text or "")
+    cleaned = unescape(re.sub(r"\s+", " ", cleaned)).strip()
+
+    words = cleaned.split()
+    if len(words) > 100:
+        return " ".join(words[:100]).strip()
+
+    if len(words) < 50:
+        title_words = re.sub(r"\s+", " ", title or "").strip().split()
+        combined = title_words + words
+        filler = (
+            "Market participants are evaluating near term impact, and analysts are watching "
+            "earnings expectations, policy direction, and risk sentiment for potential shifts."
+        ).split()
+        while len(combined) < 50:
+            combined.extend(filler)
+        return " ".join(combined[:100]).strip()
+
+    return " ".join(words[:100]).strip()
+
+def _guess_sentiment(title: str, summary: str) -> str:
+    text = f"{title} {summary}".lower()
+    positive_keywords = [
+        "rally",
+        "gain",
+        "up",
+        "growth",
+        "profit",
+        "record high",
+        "beat",
+        "strong",
+        "surge",
+    ]
+    negative_keywords = [
+        "drop",
+        "down",
+        "fall",
+        "loss",
+        "cut",
+        "weak",
+        "concern",
+        "inflation risk",
+        "slump",
+    ]
+
+    positive_score = sum(1 for word in positive_keywords if word in text)
+    negative_score = sum(1 for word in negative_keywords if word in text)
+
+    if positive_score > negative_score:
+        return "positive"
+    if negative_score > positive_score:
+        return "negative"
+    return "neutral"
+
+def _parse_rss_items(xml_data: bytes, default_source: str) -> List[FinancialNewsItem]:
+    root = ET.fromstring(xml_data)
+    items: List[FinancialNewsItem] = []
+
+    for item in root.findall(".//item"):
+        title = (item.findtext("title") or "").strip()
+        link = (item.findtext("link") or "").strip()
+        description = (item.findtext("description") or "").strip()
+        source = default_source
+
+        source_node = item.find("source")
+        if source_node is not None and (source_node.text or "").strip():
+            source = source_node.text.strip()
+
+        pub_date_raw = (item.findtext("pubDate") or "").strip()
+        published_at = None
+        if pub_date_raw:
+            try:
+                published_at = datetime.strptime(pub_date_raw, "%a, %d %b %Y %H:%M:%S %z")
+            except Exception:
+                published_at = None
+
+        if not title or not link:
+            continue
+
+        summary = _extract_summary(title, description)
+        items.append(
+            FinancialNewsItem(
+                title=title,
+                summary=summary,
+                source=source,
+                link=link,
+                published_at=published_at,
+                sentiment=_guess_sentiment(title, summary),
+            )
+        )
+
+    return items
 
 # ==================== ROUTES ====================
 
@@ -381,6 +497,76 @@ async def update_transaction_category(transaction_id: str, request: TransactionC
     )
     return Transaction(**updated_transaction)
 
+@api_router.put("/transactions/{transaction_id}/amount", response_model=Transaction)
+async def update_transaction_amount(transaction_id: str, request: TransactionAmountUpdate):
+    if request.amount <= 0:
+        raise HTTPException(status_code=400, detail="Amount must be greater than 0")
+
+    update_result = await db.transactions.update_one(
+        {"id": transaction_id, "user_id": request.user_id},
+        {"$set": {"amount": float(request.amount)}},
+    )
+
+    if update_result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+
+    updated_transaction = await db.transactions.find_one(
+        {"id": transaction_id, "user_id": request.user_id}
+    )
+    return Transaction(**updated_transaction)
+
+@api_router.put("/transactions/{transaction_id}", response_model=Transaction)
+async def update_transaction(transaction_id: str, request: TransactionUpdateRequest):
+    allowed_categories = {
+        "Food",
+        "Transport",
+        "Shopping",
+        "Bills",
+        "Entertainment",
+        "Health",
+        "Education",
+        "Travel",
+        "Other",
+    }
+
+    update_fields: Dict[str, object] = {}
+
+    if request.amount is not None:
+        if request.amount <= 0:
+            raise HTTPException(status_code=400, detail="Amount must be greater than 0")
+        update_fields["amount"] = float(request.amount)
+
+    if request.category is not None:
+        normalized_category = request.category.strip().title()
+        if normalized_category not in allowed_categories:
+            raise HTTPException(status_code=400, detail="Invalid category")
+        update_fields["category"] = normalized_category
+
+    if request.description is not None:
+        cleaned_description = request.description.strip()
+        if not cleaned_description:
+            raise HTTPException(status_code=400, detail="Description cannot be empty")
+        update_fields["description"] = cleaned_description
+
+    if request.date is not None:
+        update_fields["date"] = request.date
+
+    if not update_fields:
+        raise HTTPException(status_code=400, detail="No fields provided to update")
+
+    update_result = await db.transactions.update_one(
+        {"id": transaction_id, "user_id": request.user_id},
+        {"$set": update_fields},
+    )
+
+    if update_result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+
+    updated_transaction = await db.transactions.find_one(
+        {"id": transaction_id, "user_id": request.user_id}
+    )
+    return Transaction(**updated_transaction)
+
 @api_router.get("/transactions/{user_id}/analytics")
 async def get_transaction_analytics(user_id: str, days: int = 30):
     start_date = datetime.utcnow() - timedelta(days=days)
@@ -493,6 +679,44 @@ async def get_ai_insights(user_id: str):
 async def get_category_insights(user_id: str, category: str):
     insights = await generate_category_insights(user_id, category)
     return {"insights": insights}
+
+@api_router.get("/news/financial", response_model=List[FinancialNewsItem])
+async def get_financial_news(limit: int = 10):
+    rss_sources = [
+        ("https://feeds.reuters.com/reuters/businessNews", "Reuters Business"),
+        ("https://feeds.finance.yahoo.com/rss/2.0/headline?s=%5EGSPC&region=US&lang=en-US", "Yahoo Finance"),
+        ("https://www.investing.com/rss/news_25.rss", "Investing.com"),
+    ]
+
+    aggregated: List[FinancialNewsItem] = []
+
+    for url, source_name in rss_sources:
+        try:
+            request = Request(
+                url,
+                headers={"User-Agent": "SpendWiseNewsBot/1.0"},
+            )
+            with urlopen(request, timeout=8) as response:
+                xml_data = response.read()
+            aggregated.extend(_parse_rss_items(xml_data, source_name))
+        except Exception as error:
+            logging.warning(f"Failed to fetch financial news from {source_name}: {error}")
+
+    if not aggregated:
+        raise HTTPException(status_code=503, detail="Unable to fetch financial news right now")
+
+    dedup: Dict[str, FinancialNewsItem] = {}
+    for item in aggregated:
+        if item.link not in dedup:
+            dedup[item.link] = item
+
+    sorted_items = sorted(
+        dedup.values(),
+        key=lambda item: item.published_at or datetime.min,
+        reverse=True,
+    )
+
+    return sorted_items[: max(1, min(limit, 25))]
 
 @api_router.post("/chat")
 async def chat_with_ai(request: ChatRequest):
