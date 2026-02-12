@@ -67,6 +67,7 @@ class Transaction(BaseModel):
     description: str
     date: datetime
     source: str
+    transaction_type: str = "debit"
     sentiment: Optional[str] = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
@@ -75,6 +76,7 @@ class TransactionCreate(BaseModel):
     amount: float
     description: str
     date: Optional[datetime] = None
+    transaction_type: Optional[str] = None
 
 class SMSTransactionRequest(BaseModel):
     user_id: str
@@ -93,6 +95,7 @@ class TransactionUpdateRequest(BaseModel):
     user_id: str
     amount: Optional[float] = None
     category: Optional[str] = None
+    transaction_type: Optional[str] = None
     description: Optional[str] = None
     date: Optional[datetime] = None
 
@@ -203,6 +206,46 @@ Return ONLY JSON:
     except Exception as e:
         logging.error(e)
         return {"category": "Other", "sentiment": "neutral"}
+
+def normalize_transaction_type(value: str) -> str:
+    normalized = (value or "").strip().lower()
+    if normalized not in {"credit", "debit"}:
+        raise HTTPException(status_code=400, detail="transaction_type must be 'credit' or 'debit'")
+    return normalized
+
+def infer_transaction_type(text: str) -> str:
+    lowered = (text or "").lower()
+
+    credit_keywords = [
+        "credited",
+        "credit alert",
+        "received",
+        "salary",
+        "refund",
+        "cashback",
+        "cash back",
+        "deposited",
+        "deposit",
+        "interest credited",
+        "reversal",
+    ]
+    debit_keywords = [
+        "debited",
+        "spent",
+        "purchase",
+        "withdrawn",
+        "paid",
+        "bill",
+        "emi",
+        "sent",
+        "transfer to",
+    ]
+
+    if any(keyword in lowered for keyword in credit_keywords):
+        return "credit"
+    if any(keyword in lowered for keyword in debit_keywords):
+        return "debit"
+    return "debit"
 
 async def generate_insights(user_id: str) -> str:
     transactions = await db.transactions.find(
@@ -423,6 +466,11 @@ async def create_manual_transaction(transaction: TransactionCreate):
     trans_dict["source"] = "manual"
     trans_dict["category"] = ai_result["category"]
     trans_dict["sentiment"] = ai_result["sentiment"]
+    trans_dict["transaction_type"] = (
+        normalize_transaction_type(transaction.transaction_type)
+        if transaction.transaction_type
+        else infer_transaction_type(transaction.description)
+    )
 
     trans_obj = Transaction(**trans_dict)
     await db.transactions.insert_one(trans_obj.dict())
@@ -453,6 +501,7 @@ async def create_sms_transaction(request: SMSTransactionRequest):
         description=request.sms_text[:100],
         date=request.date or datetime.utcnow(),
         source="sms",
+        transaction_type=infer_transaction_type(request.sms_text),
         sentiment=ai_result["sentiment"],
     )
 
@@ -542,6 +591,11 @@ async def update_transaction(transaction_id: str, request: TransactionUpdateRequ
             raise HTTPException(status_code=400, detail="Invalid category")
         update_fields["category"] = normalized_category
 
+    if request.transaction_type is not None:
+        update_fields["transaction_type"] = normalize_transaction_type(
+            request.transaction_type
+        )
+
     if request.description is not None:
         cleaned_description = request.description.strip()
         if not cleaned_description:
@@ -575,15 +629,29 @@ async def get_transaction_analytics(user_id: str, days: int = 30):
         {"user_id": user_id, "date": {"$gte": start_date}}
     ).to_list(1000)
 
-    total_spending = sum(t.get("amount", 0) for t in transactions)
+    total_debit = sum(
+        t.get("amount", 0)
+        for t in transactions
+        if t.get("transaction_type", "debit") == "debit"
+    )
+    total_credit = sum(
+        t.get("amount", 0)
+        for t in transactions
+        if t.get("transaction_type", "debit") == "credit"
+    )
+    total_spending = total_debit
 
     categories: Dict[str, float] = {}
     for t in transactions:
+        if t.get("transaction_type", "debit") != "debit":
+            continue
         cat = t.get("category", "Other")
         categories[cat] = categories.get(cat, 0) + t.get("amount", 0)
 
     daily_spending: Dict[str, float] = {}
     for t in transactions:
+        if t.get("transaction_type", "debit") != "debit":
+            continue
         date_key = t.get("date", datetime.utcnow()).strftime("%Y-%m-%d")
         daily_spending[date_key] = daily_spending.get(date_key, 0) + t.get("amount", 0)
 
@@ -594,8 +662,12 @@ async def get_transaction_analytics(user_id: str, days: int = 30):
 
     return {
         "total_spending": total_spending,
+        "total_debit": total_debit,
+        "total_credit": total_credit,
         "transaction_count": len(transactions),
-        "average_transaction": total_spending / len(transactions) if transactions else 0,
+        "average_transaction": (
+            total_debit / max(1, len([t for t in transactions if t.get("transaction_type", "debit") == "debit"]))
+        ),
         "categories": categories,
         "daily_spending": daily_spending,
         "sentiment": sentiment_counts,
@@ -712,7 +784,7 @@ async def get_financial_news(limit: int = 10):
 
     sorted_items = sorted(
         dedup.values(),
-        key=lambda item: item.published_at or datetime.min,
+        key=lambda item: item.published_at.timestamp() if item.published_at else 0,
         reverse=True,
     )
 
