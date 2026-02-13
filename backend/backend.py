@@ -7,7 +7,7 @@ import logging
 from pathlib import Path
 from pydantic import BaseModel, Field
 from pydantic import EmailStr
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Any
 import uuid
 from datetime import datetime, timedelta
 import json
@@ -38,6 +38,7 @@ groq_client = AsyncOpenAI(
 app = FastAPI()
 api_router = APIRouter(prefix="/api")
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+RUPEE_SYMBOL = "\u20B9"
 
 # ==================== LLM HELPER ====================
 
@@ -264,7 +265,7 @@ async def generate_insights(user_id: str) -> str:
 
     prompt = f"""
 User spending:
-Total: ${total_spending:.2f}
+Total: {RUPEE_SYMBOL}{total_spending:.2f}
 Categories: {categories}
 
 Provide 3 financial tips.
@@ -288,8 +289,8 @@ async def generate_category_insights(user_id: str, category: str) -> str:
     prompt = f"""
 Category: {category}
 Recent count: {len(transactions)}
-Total: ${total_spending:.2f}
-Average: ${avg_spending:.2f}
+Total: {RUPEE_SYMBOL}{total_spending:.2f}
+Average: {RUPEE_SYMBOL}{avg_spending:.2f}
 Most recent: {latest_desc}
 
 Provide 2 concise, actionable insights for this category.
@@ -390,6 +391,166 @@ def _parse_rss_items(xml_data: bytes, default_source: str) -> List[FinancialNews
         )
 
     return items
+
+
+def _format_inr(amount: float) -> str:
+    return f"{RUPEE_SYMBOL}{float(amount):,.2f}"
+
+
+def _as_datetime(value: Any) -> datetime:
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        raw = value.replace("Z", "+00:00")
+        try:
+            return datetime.fromisoformat(raw)
+        except Exception:
+            return datetime.utcnow()
+    return datetime.utcnow()
+
+
+def _enforce_rupee_only(text: str) -> str:
+    if not text:
+        return text
+
+    normalized = re.sub(r"\bUSD\b", "INR", text, flags=re.IGNORECASE)
+    normalized = re.sub(
+        r"\$\s*([0-9][0-9,]*(?:\.[0-9]+)?)",
+        fr"{RUPEE_SYMBOL}\1",
+        normalized,
+    )
+    normalized = re.sub(r"\bRs\.?\s*", RUPEE_SYMBOL, normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r"\bdollars?\b", "rupees", normalized, flags=re.IGNORECASE)
+    return normalized
+
+
+def _is_data_question(message: str) -> bool:
+    lowered = (message or "").lower()
+    keywords = [
+        "spend",
+        "spent",
+        "expense",
+        "expenses",
+        "transaction",
+        "transactions",
+        "category",
+        "categories",
+        "balance",
+        "credit",
+        "debit",
+        "income",
+        "cashflow",
+        "cash flow",
+        "monthly",
+        "month",
+        "today",
+        "week",
+        "summary",
+        "analytics",
+        "report",
+    ]
+    return any(word in lowered for word in keywords)
+
+
+async def _tool_build_financial_snapshot(user_id: str) -> Dict[str, Any]:
+    transactions = await db.transactions.find({"user_id": user_id}).sort("date", -1).limit(500).to_list(500)
+
+    now = datetime.utcnow()
+    month_start = datetime(now.year, now.month, 1)
+
+    total_debit = 0.0
+    total_credit = 0.0
+    month_debit = 0.0
+    month_credit = 0.0
+    today_debit = 0.0
+    today_credit = 0.0
+    category_totals: Dict[str, float] = {}
+    recent_items: List[Dict[str, str]] = []
+
+    for index, item in enumerate(transactions):
+        amount = float(item.get("amount", 0) or 0)
+        tx_type = str(item.get("transaction_type", "debit")).lower()
+        tx_date = _as_datetime(item.get("date"))
+        category = str(item.get("category", "Other"))
+
+        if tx_type == "credit":
+            total_credit += amount
+            if tx_date >= month_start:
+                month_credit += amount
+            if tx_date.date() == now.date():
+                today_credit += amount
+        else:
+            total_debit += amount
+            if tx_date >= month_start:
+                month_debit += amount
+            if tx_date.date() == now.date():
+                today_debit += amount
+            category_totals[category] = category_totals.get(category, 0) + amount
+
+        if index < 5:
+            recent_items.append(
+                {
+                    "date": tx_date.strftime("%d %b %Y"),
+                    "category": category,
+                    "amount": _format_inr(amount),
+                    "type": tx_type,
+                    "description": str(item.get("description", ""))[:80],
+                }
+            )
+
+    top_categories = sorted(category_totals.items(), key=lambda pair: pair[1], reverse=True)[:5]
+
+    return {
+        "transaction_count": len(transactions),
+        "total_debit": total_debit,
+        "total_credit": total_credit,
+        "net_cashflow": total_credit - total_debit,
+        "month_debit": month_debit,
+        "month_credit": month_credit,
+        "today_debit": today_debit,
+        "today_credit": today_credit,
+        "top_categories": top_categories,
+        "recent_transactions": recent_items,
+    }
+
+
+def _build_data_answer(message: str, snapshot: Dict[str, Any]) -> str:
+    if snapshot["transaction_count"] == 0:
+        return (
+            "I could not find any transactions yet. "
+            f"Once your transactions are added, I can answer data questions in rupees ({RUPEE_SYMBOL})."
+        )
+
+    lowered = (message or "").lower()
+    lines = [
+        "Here is your latest financial data:",
+        f"Total debit: {_format_inr(snapshot['total_debit'])}",
+        f"Total credit: {_format_inr(snapshot['total_credit'])}",
+        f"Net cashflow: {_format_inr(snapshot['net_cashflow'])}",
+        f"This month debit: {_format_inr(snapshot['month_debit'])}",
+        f"This month credit: {_format_inr(snapshot['month_credit'])}",
+    ]
+
+    if "today" in lowered:
+        lines.append(f"Today debit: {_format_inr(snapshot['today_debit'])}")
+        lines.append(f"Today credit: {_format_inr(snapshot['today_credit'])}")
+
+    if any(word in lowered for word in ["category", "categories", "top"]):
+        if snapshot["top_categories"]:
+            lines.append("Top spending categories:")
+            for category, amount in snapshot["top_categories"]:
+                lines.append(f"- {category}: {_format_inr(amount)}")
+
+    if any(word in lowered for word in ["recent", "last", "latest", "transaction"]):
+        if snapshot["recent_transactions"]:
+            lines.append("Recent transactions:")
+            for item in snapshot["recent_transactions"]:
+                sign = "+" if item["type"] == "credit" else "-"
+                lines.append(
+                    f"- {item['date']} | {item['category']} | {sign}{item['amount']} | {item['description']}"
+                )
+
+    return "\n".join(lines)
 
 # ==================== ROUTES ====================
 
@@ -799,18 +960,38 @@ async def chat_with_ai(request: ChatRequest):
     )
     await db.chat_messages.insert_one(user_msg.dict())
 
-    transactions = await db.transactions.find(
-        {"user_id": request.user_id}
-    ).limit(10).to_list(10)
+    snapshot = await _tool_build_financial_snapshot(request.user_id)
 
-    total_spending = sum(t.get("amount", 0) for t in transactions)
+    if _is_data_question(request.message):
+        response = _build_data_answer(request.message, snapshot)
+    else:
+        categories_context = ", ".join(
+            f"{category}: {_format_inr(amount)}"
+            for category, amount in snapshot["top_categories"]
+        ) or "No category data yet"
 
-    context = f"User recent spending total: ${total_spending:.2f}"
+        context = (
+            "User financial tool output:\n"
+            f"- Transactions tracked: {snapshot['transaction_count']}\n"
+            f"- Total debit: {_format_inr(snapshot['total_debit'])}\n"
+            f"- Total credit: {_format_inr(snapshot['total_credit'])}\n"
+            f"- Net cashflow: {_format_inr(snapshot['net_cashflow'])}\n"
+            f"- This month debit: {_format_inr(snapshot['month_debit'])}\n"
+            f"- This month credit: {_format_inr(snapshot['month_credit'])}\n"
+            f"- Top categories: {categories_context}\n"
+            f"Important: Always use Indian rupee symbol ({RUPEE_SYMBOL}). Never use $ or USD."
+        )
 
-    response = await invoke_llm(
-        f"You are a helpful financial advisor. {context}",
-        request.message,
-    )
+        response = await invoke_llm(
+            (
+                "You are a helpful financial advisor for an Indian user. "
+                f"Use only rupee symbol ({RUPEE_SYMBOL}) for all currency values. "
+                "If user asks about personal financial data, rely on provided tool output."
+            ),
+            f"{context}\n\nUser question: {request.message}",
+        )
+
+    response = _enforce_rupee_only(response)
 
     assistant_msg = ChatMessage(
         user_id=request.user_id,
