@@ -70,6 +70,9 @@ class Transaction(BaseModel):
     source: str
     transaction_type: str = "debit"
     sentiment: Optional[str] = None
+    ref_id: Optional[str] = None
+    merchant_key: Optional[str] = None
+    upi_id: Optional[str] = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
 class TransactionCreate(BaseModel):
@@ -87,6 +90,7 @@ class SMSTransactionRequest(BaseModel):
 class TransactionCategoryUpdate(BaseModel):
     user_id: str
     category: str
+    apply_to_similar: bool = False
 
 class TransactionAmountUpdate(BaseModel):
     user_id: str
@@ -99,6 +103,17 @@ class TransactionUpdateRequest(BaseModel):
     transaction_type: Optional[str] = None
     description: Optional[str] = None
     date: Optional[datetime] = None
+
+
+class TransactionSimilarityRequest(BaseModel):
+    user_id: str
+
+
+class TransactionSimilarityResponse(BaseModel):
+    match_count: int
+    merchant_key: Optional[str] = None
+    upi_id: Optional[str] = None
+    sample_descriptions: List[str] = []
 
 class ChatRequest(BaseModel):
     user_id: str
@@ -247,6 +262,93 @@ def infer_transaction_type(text: str) -> str:
     if any(keyword in lowered for keyword in debit_keywords):
         return "debit"
     return "debit"
+
+
+def _normalize_merchant_label(value: str) -> str:
+    cleaned = re.sub(r"[^a-zA-Z0-9@._ -]", " ", value or "")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip().lower()
+    return cleaned[:80]
+
+
+def _extract_ref_id(text: str) -> Optional[str]:
+    sms = text or ""
+    patterns = [
+        r"(?:utr|rrn|ref(?:erence)?(?:\s*no)?|txn(?:\s*id)?|transaction\s*id)\s*[:\-]?\s*([A-Za-z0-9]{6,30})",
+        r"\b([A-Z0-9]{10,24})\b",
+    ]
+
+    candidates: List[str] = []
+    for pattern in patterns:
+        for match in re.finditer(pattern, sms, flags=re.IGNORECASE):
+            value = (match.group(1) or "").strip().upper()
+            if len(value) >= 6:
+                candidates.append(value)
+        if candidates:
+            break
+
+    if not candidates:
+        return None
+
+    return sorted(candidates, key=len, reverse=True)[0]
+
+
+def _extract_upi_id(text: str) -> Optional[str]:
+    sms = text or ""
+    match = re.search(r"\b([a-zA-Z0-9.\-_]{2,})@([a-zA-Z]{2,})\b", sms)
+    if not match:
+        return None
+    return f"{match.group(1).lower()}@{match.group(2).lower()}"
+
+
+def _extract_merchant_key(text: str) -> Optional[str]:
+    sms = text or ""
+    upi_id = _extract_upi_id(sms)
+    if upi_id:
+        return f"upi:{upi_id}"
+
+    patterns = [
+        r"(?:to|at|for|towards)\s+([A-Za-z0-9&._ -]{3,40})",
+        r"(?:merchant|payee)\s*[:\-]?\s*([A-Za-z0-9&._ -]{3,40})",
+        r"(?:on)\s+([A-Za-z0-9&._ -]{3,40})",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, sms, flags=re.IGNORECASE)
+        if match:
+            merchant = _normalize_merchant_label(match.group(1))
+            if merchant:
+                return f"merchant:{merchant}"
+
+    fallback = _normalize_merchant_label(sms[:40])
+    return f"merchant:{fallback}" if fallback else None
+
+
+def _build_similar_match_query(
+    user_id: str,
+    base_transaction_id: str,
+    merchant_key: Optional[str],
+    upi_id: Optional[str],
+) -> Dict[str, Any]:
+    query: Dict[str, Any] = {"user_id": user_id, "id": {"$ne": base_transaction_id}}
+
+    or_conditions: List[Dict[str, Any]] = []
+    if upi_id:
+        escaped_upi = re.escape(upi_id)
+        or_conditions.append({"upi_id": upi_id})
+        or_conditions.append({"description": {"$regex": escaped_upi, "$options": "i"}})
+
+    if merchant_key:
+        merchant_label = merchant_key.replace("merchant:", "", 1).strip()
+        or_conditions.append({"merchant_key": merchant_key})
+        if merchant_label:
+            escaped_label = re.escape(merchant_label)
+            or_conditions.append(
+                {"description": {"$regex": escaped_label, "$options": "i"}}
+            )
+
+    if or_conditions:
+        query["$or"] = or_conditions
+
+    return query
 
 async def generate_insights(user_id: str) -> str:
     transactions = await db.transactions.find(
@@ -636,6 +738,8 @@ async def create_manual_transaction(transaction: TransactionCreate):
         if transaction.transaction_type
         else infer_transaction_type(transaction.description)
     )
+    trans_dict["upi_id"] = _extract_upi_id(transaction.description)
+    trans_dict["merchant_key"] = _extract_merchant_key(transaction.description)
 
     trans_obj = Transaction(**trans_dict)
     await db.transactions.insert_one(trans_obj.dict())
@@ -659,19 +763,102 @@ async def create_sms_transaction(request: SMSTransactionRequest):
         amount,
     )
 
+    transaction_date = request.date or datetime.utcnow()
+    description = request.sms_text[:100]
+    ref_id = _extract_ref_id(request.sms_text)
+    upi_id = _extract_upi_id(request.sms_text)
+    merchant_key = _extract_merchant_key(request.sms_text)
+
+    if ref_id:
+        existing_by_ref = await db.transactions.find_one(
+            {
+                "user_id": request.user_id,
+                "source": "sms",
+                "ref_id": ref_id,
+            }
+        )
+        if existing_by_ref:
+            return Transaction(**existing_by_ref)
+
+    start_window = transaction_date - timedelta(minutes=3)
+    end_window = transaction_date + timedelta(minutes=3)
+    fallback_query: Dict[str, Any] = {
+        "user_id": request.user_id,
+        "source": "sms",
+        "amount": amount,
+        "date": {"$gte": start_window, "$lte": end_window},
+    }
+    if merchant_key:
+        fallback_query["$or"] = [
+            {"merchant_key": merchant_key},
+            {"description": description},
+        ]
+    else:
+        fallback_query["description"] = description
+
+    existing_sms_transaction = await db.transactions.find_one(fallback_query)
+    if existing_sms_transaction:
+        return Transaction(**existing_sms_transaction)
+
     trans_obj = Transaction(
         user_id=request.user_id,
         amount=amount,
         category=ai_result["category"],
-        description=request.sms_text[:100],
-        date=request.date or datetime.utcnow(),
+        description=description,
+        date=transaction_date,
         source="sms",
         transaction_type=infer_transaction_type(request.sms_text),
         sentiment=ai_result["sentiment"],
+        ref_id=ref_id,
+        merchant_key=merchant_key,
+        upi_id=upi_id,
     )
 
     await db.transactions.insert_one(trans_obj.dict())
     return trans_obj
+
+
+@api_router.post(
+    "/transactions/{transaction_id}/similar-preview",
+    response_model=TransactionSimilarityResponse,
+)
+async def preview_similar_transactions(
+    transaction_id: str, request: TransactionSimilarityRequest
+):
+    selected_transaction = await db.transactions.find_one(
+        {"id": transaction_id, "user_id": request.user_id}
+    )
+    if not selected_transaction:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+
+    merchant_key = selected_transaction.get("merchant_key") or _extract_merchant_key(
+        selected_transaction.get("description", "")
+    )
+    upi_id = selected_transaction.get("upi_id") or _extract_upi_id(
+        selected_transaction.get("description", "")
+    )
+
+    if not merchant_key and not upi_id:
+        return TransactionSimilarityResponse(
+            match_count=0, merchant_key=None, upi_id=None, sample_descriptions=[]
+        )
+
+    query = _build_similar_match_query(
+        user_id=request.user_id,
+        base_transaction_id=transaction_id,
+        merchant_key=merchant_key,
+        upi_id=upi_id,
+    )
+
+    similar_transactions = await db.transactions.find(query).sort("date", -1).limit(5).to_list(5)
+    match_count = await db.transactions.count_documents(query)
+
+    return TransactionSimilarityResponse(
+        match_count=match_count,
+        merchant_key=merchant_key,
+        upi_id=upi_id,
+        sample_descriptions=[str(item.get("description", ""))[:80] for item in similar_transactions],
+    )
 
 @api_router.get("/transactions/{user_id}", response_model=List[Transaction])
 async def get_user_transactions(user_id: str, limit: int = 50):
@@ -715,6 +902,28 @@ async def update_transaction_category(transaction_id: str, request: TransactionC
     updated_transaction = await db.transactions.find_one(
         {"id": transaction_id, "user_id": request.user_id}
     )
+
+    if request.apply_to_similar and updated_transaction:
+        merchant_key = updated_transaction.get("merchant_key") or _extract_merchant_key(
+            updated_transaction.get("description", "")
+        )
+        upi_id = updated_transaction.get("upi_id") or _extract_upi_id(
+            updated_transaction.get("description", "")
+        )
+
+        bulk_query = _build_similar_match_query(
+            user_id=request.user_id,
+            base_transaction_id=transaction_id,
+            merchant_key=merchant_key,
+            upi_id=upi_id,
+        )
+
+        if bulk_query.get("$or"):
+            await db.transactions.update_many(
+                bulk_query,
+                {"$set": {"category": normalized_category}},
+            )
+
     return Transaction(**updated_transaction)
 
 @api_router.put("/transactions/{transaction_id}/amount", response_model=Transaction)
@@ -772,6 +981,8 @@ async def update_transaction(transaction_id: str, request: TransactionUpdateRequ
         if not cleaned_description:
             raise HTTPException(status_code=400, detail="Description cannot be empty")
         update_fields["description"] = cleaned_description
+        update_fields["upi_id"] = _extract_upi_id(cleaned_description)
+        update_fields["merchant_key"] = _extract_merchant_key(cleaned_description)
 
     if request.date is not None:
         update_fields["date"] = request.date
