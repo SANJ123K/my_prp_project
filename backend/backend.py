@@ -373,7 +373,23 @@ Categories: {categories}
 Provide 3 financial tips.
 """
 
-    return await invoke_llm("You are a financial advisor.", prompt)
+    try:
+        return await invoke_llm("You are a financial advisor.", prompt)
+    except Exception as error:
+        logging.exception("LLM insight generation failed: %s", error)
+        top_categories = sorted(
+            categories.items(), key=lambda item: item[1], reverse=True
+        )[:3]
+        category_text = (
+            ", ".join(f"{name} ({_format_inr(amount)})" for name, amount in top_categories)
+            if top_categories
+            else "No dominant category yet"
+        )
+        return (
+            f"Total spend tracked: {_format_inr(total_spending)}. "
+            f"Top categories: {category_text}. "
+            "Tip: set weekly limits on your top category and review daily transactions."
+        )
 
 async def generate_category_insights(user_id: str, category: str) -> str:
     transactions = await db.transactions.find(
@@ -398,7 +414,15 @@ Most recent: {latest_desc}
 Provide 2 concise, actionable insights for this category.
 """
 
-    return await invoke_llm("You are a financial advisor.", prompt)
+    try:
+        return await invoke_llm("You are a financial advisor.", prompt)
+    except Exception as error:
+        logging.exception("LLM category insight generation failed: %s", error)
+        return (
+            f"{category}: {len(transactions)} transactions, "
+            f"total {_format_inr(total_spending)}, average {_format_inr(avg_spending)}. "
+            "Tip: compare each spend to previous month and cut low-value repeats."
+        )
 
 def _extract_summary(title: str, text: str) -> str:
     cleaned = re.sub(r"<[^>]+>", " ", text or "")
@@ -1126,13 +1150,29 @@ async def update_habit_progress(user_id: str, category: str, amount: float):
 
 @api_router.get("/insights/{user_id}")
 async def get_ai_insights(user_id: str):
-    insights = await generate_insights(user_id)
-    return {"insights": insights}
+    try:
+        insights = await generate_insights(user_id)
+        return {"insights": insights}
+    except Exception as error:
+        logging.exception("Insights endpoint failed for user %s: %s", user_id, error)
+        return {
+            "insights": "Unable to load AI insights right now. "
+            "Your transactions are still synced and available in analytics."
+        }
 
 @api_router.get("/insights/{user_id}/category/{category}")
 async def get_category_insights(user_id: str, category: str):
-    insights = await generate_category_insights(user_id, category)
-    return {"insights": insights}
+    try:
+        insights = await generate_category_insights(user_id, category)
+        return {"insights": insights}
+    except Exception as error:
+        logging.exception(
+            "Category insights endpoint failed for user %s category %s: %s",
+            user_id,
+            category,
+            error,
+        )
+        return {"insights": f"Unable to load insights for {category} right now."}
 
 @api_router.get("/news/financial", response_model=List[FinancialNewsItem])
 async def get_financial_news(limit: int = 10):
