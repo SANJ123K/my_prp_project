@@ -409,6 +409,10 @@ def _as_datetime(value: Any) -> datetime:
     return datetime.utcnow()
 
 
+def _transaction_datetime(item: Dict[str, Any]) -> datetime:
+    return _as_datetime(item.get("date") or item.get("created_at"))
+
+
 def _enforce_rupee_only(text: str) -> str:
     if not text:
         return text
@@ -470,7 +474,7 @@ async def _tool_build_financial_snapshot(user_id: str) -> Dict[str, Any]:
     for index, item in enumerate(transactions):
         amount = float(item.get("amount", 0) or 0)
         tx_type = str(item.get("transaction_type", "debit")).lower()
-        tx_date = _as_datetime(item.get("date"))
+        tx_date = _transaction_datetime(item)
         category = str(item.get("category", "Other"))
 
         if tx_type == "credit":
@@ -671,10 +675,16 @@ async def create_sms_transaction(request: SMSTransactionRequest):
 
 @api_router.get("/transactions/{user_id}", response_model=List[Transaction])
 async def get_user_transactions(user_id: str, limit: int = 50):
-    transactions = await db.transactions.find(
-        {"user_id": user_id}
-    ).sort("date", -1).limit(limit).to_list(limit)
-    return [Transaction(**t) for t in transactions]
+    raw_transactions = await db.transactions.find({"user_id": user_id}).to_list(2000)
+
+    normalized: List[Dict[str, Any]] = []
+    for item in raw_transactions:
+        doc = dict(item)
+        doc["date"] = doc.get("date") or doc.get("created_at") or datetime.utcnow()
+        normalized.append(doc)
+
+    normalized.sort(key=lambda tx: _transaction_datetime(tx), reverse=True)
+    return [Transaction(**t) for t in normalized[: max(1, limit)]]
 
 @api_router.put("/transactions/{transaction_id}/category", response_model=Transaction)
 async def update_transaction_category(transaction_id: str, request: TransactionCategoryUpdate):
@@ -785,10 +795,10 @@ async def update_transaction(transaction_id: str, request: TransactionUpdateRequ
 @api_router.get("/transactions/{user_id}/analytics")
 async def get_transaction_analytics(user_id: str, days: int = 30):
     start_date = datetime.utcnow() - timedelta(days=days)
-
-    transactions = await db.transactions.find(
-        {"user_id": user_id, "date": {"$gte": start_date}}
-    ).to_list(1000)
+    raw_transactions = await db.transactions.find({"user_id": user_id}).to_list(3000)
+    transactions = [
+        t for t in raw_transactions if _transaction_datetime(t) >= start_date
+    ]
 
     total_debit = sum(
         t.get("amount", 0)
@@ -813,7 +823,7 @@ async def get_transaction_analytics(user_id: str, days: int = 30):
     for t in transactions:
         if t.get("transaction_type", "debit") != "debit":
             continue
-        date_key = t.get("date", datetime.utcnow()).strftime("%Y-%m-%d")
+        date_key = _transaction_datetime(t).strftime("%Y-%m-%d")
         daily_spending[date_key] = daily_spending.get(date_key, 0) + t.get("amount", 0)
 
     sentiment_counts = {"positive": 0, "neutral": 0, "negative": 0}
